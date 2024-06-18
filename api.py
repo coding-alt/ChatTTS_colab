@@ -1,6 +1,10 @@
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+
 import os
 import sys
 sys.path.insert(0, os.getcwd())
+import argparse
 import ChatTTS
 import re
 import time
@@ -29,10 +33,15 @@ from pydantic import BaseModel
 
 import uvicorn
 
-
 from typing import Generator
 
+from joblib import Parallel, delayed
 
+parser = argparse.ArgumentParser(description="ChatTTS API")
+parser.add_argument("--server_name", type=str, default="0.0.0.0", help="Server name.")
+parser.add_argument("--server_port", type=int, default=8002, help="Server port.")
+
+args = parser.parse_args()
 
 chat = ChatTTS.Chat()
 def clear_cuda_cache():
@@ -59,15 +68,10 @@ def deterministic(seed=0):
 
 class TTS_Request(BaseModel):
     text: str = None
-    seed: int = 2581
     speed: int = 3
     media_type: str = "wav"
     streaming: int = 0
-
-
-
-
-
+    spk_id: str = "default"
 
 app = FastAPI()
 
@@ -156,84 +160,80 @@ def pack_audio(io_buffer:BytesIO, data:np.ndarray, rate:int, media_type:str):
     return io_buffer
 
 
-def generate_tts_audio(text_file,seed=2581,speed=3, oral=0, laugh=0, bk=4, min_length=10, batch_size=5, temperature=0.3, top_P=0.7,
-                       top_K=20,streaming=0,cur_tqdm=None):
+def generate_tts_audio(text_file, spk_id="default", speed=3, oral=0, laugh=0, bk=4, min_length=10, batch_size=5, streaming=0, cur_tqdm=None):
 
     from utils import combine_audio, save_audio, batch_split
 
     from utils import split_text
-
-
-    if seed in [0, -1, None]:
-        seed = random.randint(1, 9999)
-
     
     content = text_file
     texts = split_text(content, min_length=min_length)
+
+    spk_file = f"./speaker_config/{spk_id}.json"
+    if not os.path.exists(spk_file):
+        print(f"Speaker config file not found: {spk_file}, use defalut config instead.")
+        spk_file = "./speaker_config/default.json"
     
+    with open(spk_file, 'r', encoding='utf-8') as f:
+        spk_data = json.load(f)
+
+    print(spk_data)
+    rnd_spk_emb = torch.load(spk_data["spk_model"])
+    print(rnd_spk_emb.shape)
+    if rnd_spk_emb.shape != (768,):
+        raise ValueError("维度应为 768。")
+    
+    speed = max(spk_data.get("speed", 3), 0)
+    oral = spk_data.get("oral", 0)
+    laugh = spk_data.get("laugh", 0)
+    bk = spk_data.get("break", 4)
 
     if oral < 0 or oral > 9 or laugh < 0 or laugh > 2 or bk < 0 or bk > 7:
         raise ValueError("oral_(0-9), laugh_(0-2), break_(0-7) out of range")
 
-    refine_text_prompt = f"[oral_{oral}][laugh_{laugh}][break_{bk}]"
-
-
-    deterministic(seed)
-    rnd_spk_emb = chat.sample_random_speaker()
     params_infer_code = {
         'spk_emb': rnd_spk_emb,
         'prompt': f'[speed_{speed}]',
-        'top_P': top_P,
-        'top_K': top_K,
-        'temperature': temperature
+        'top_P': spk_data.get("top_P", 0.7),
+        'top_K': spk_data.get("top_K", 20),
+        'temperature': spk_data.get("temperature", 0.3),
     }
+
+    refine_text_prompt = f"[oral_{oral}][laugh_{laugh}][break_{bk}]"
     params_refine_text = {
         'prompt': refine_text_prompt,
-        'top_P': top_P,
-        'top_K': top_K,
-        'temperature': temperature
+        'top_P': spk_data["top_P"],
+        'top_K': spk_data["top_K"],
+        'temperature': spk_data["temperature"]
     }
-    
 
+    start_time = time.time()
 
     if not cur_tqdm:
         cur_tqdm = tqdm
 
-    start_time = time.time()
-
     if not streaming:
-
         all_wavs = []
-
-
-
-        for batch in cur_tqdm(batch_split(texts, batch_size), desc=f"Inferring audio for seed={seed}"):
-
-            
+        for batch in cur_tqdm(batch_split(texts, batch_size), desc=f"Inferring audio for spk_id={spk_id}"):
             wavs = chat.infer(batch, params_infer_code=params_infer_code, params_refine_text=params_refine_text,use_decoder=True, skip_refine_text=False)
             audio_data = wavs[0][0]
             audio_data = audio_data / np.max(np.abs(audio_data))
-
 
             all_wavs.append(audio_data)
 
             # all_wavs.extend(wavs)
 
-            # clear_cuda_cache()
-
-        
+            clear_cuda_cache()   
 
         audio = (np.concatenate(all_wavs) * 32768).astype(
                 np.int16
             )
 
-        # end_time = time.time()
-        # elapsed_time = end_time - start_time
-        # print(f"Saving audio for seed {seed}, took {elapsed_time:.2f}s")
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"Saving audio for spk_id = {spk_id} , took {elapsed_time:.2f}s")
 
         yield audio
-
-
     else:
 
         print("流式生成")
@@ -253,11 +253,6 @@ def generate_tts_audio(text_file,seed=2581,speed=3, oral=0, laugh=0, bk=4, min_l
 
             yield audio_data
 
-
-            
-
-
-
 async def tts_handle(req:dict):
 
     media_type = req["media_type"]
@@ -266,7 +261,7 @@ async def tts_handle(req:dict):
 
     if not req["streaming"]:
     
-        audio_data = next(generate_tts_audio(req["text"],req["seed"]))
+        audio_data = next(generate_tts_audio(req["text"], req["spk_id"]))
 
         # print(audio_data)
 
@@ -282,7 +277,7 @@ async def tts_handle(req:dict):
     
     else:
         
-        tts_generator = generate_tts_audio(req["text"],req["seed"],streaming=1)
+        tts_generator = generate_tts_audio(req["text"], req["spk_id"], streaming=1)
 
         sr = 24000
 
@@ -297,12 +292,12 @@ async def tts_handle(req:dict):
 
 
 @app.get("/")
-async def tts_get(text: str = None,media_type:str = "wav",seed:int = 2581,streaming:int = 0):
+async def tts_get(text: str = None, media_type:str = "wav", spk_id:str = "default", streaming:int = 0):
     req = {
         "text": text,
         "media_type": media_type,
-        "seed": seed,
-        "streaming": streaming,
+        "spk_id": spk_id,
+        "streaming": streaming
     }
     print("第一次")
     return await tts_handle(req)
@@ -339,4 +334,4 @@ if __name__ == "__main__":
 
     # chat = load_chat_tts_model(source="local", local_path="models")
 
-    uvicorn.run(app,host='0.0.0.0',port=9880,workers=1)
+    uvicorn.run(app, host=args.server_name, port=args.server_port, workers=1)
